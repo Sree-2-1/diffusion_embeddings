@@ -5,10 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tlpp-embedding"
 version = "0.1.0"
-description = "Time-lagged phase portrait embeddings and variational autoencoders"
+description = "Universal TLPP HDF5 generation and Matryoshka VAE training for Hall-thruster discharge-current traces"
 requires-python = ">=3.10"
-dependencies = ["numpy", "scipy", "matplotlib", "torch"]
+dependencies = [
+  "numpy",
+  "h5py>=3.10",
+  "torch",
+  "matplotlib",
+]
+
+[project.scripts]
+tlpp-vae = "tlpp_embedding.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
 include = ["tlpp_embedding*"]

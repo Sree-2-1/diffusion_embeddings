@@ -1,4 +1,4 @@
 numpy
-scipy
-matplotlib
+h5py>=3.10
 torch
+matplotlib

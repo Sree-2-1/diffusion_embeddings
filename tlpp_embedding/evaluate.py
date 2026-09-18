@@ -2,258 +2,227 @@ from __future__ import annotations
 
 import csv
 import json
-import time
 from pathlib import Path
 
+import h5py
 import numpy as np
+import torch
 
-from .core import TLPPConfig, tlpp_from_signal
-from .data import TraceConfig, add_noise, alternate_windows, load_trace, phase_scramble
-from .models import TLPPVAE
-
-
-def _vector(trace, cfg: TLPPConfig, variant: str) -> np.ndarray:
-    return tlpp_from_signal(
-        trace.current_a,
-        trace.sampling_hz,
-        variant,
-        cfg,
-    ).ravel().astype(np.float64)
+from .core import TLPPConfig, transform_occupancy
+from .hdf5 import validate_universal_tlpp
+from .models import counts_to_probability, load_vae_checkpoint
+from .training import PathInputs, normalize_h5_paths
 
 
-def _symmetric_l2(a: np.ndarray, b: np.ndarray) -> float:
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    return 0.0 if na + nb <= 1e-12 else float(np.linalg.norm(a - b) / (na + nb))
-
-
-def _pairwise_distance(matrix: np.ndarray, mode: str) -> np.ndarray:
-    x = np.asarray(matrix, dtype=np.float64)
-    if mode in {"log", "log01"}:
-        y = x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
-        return np.clip(1.0 - y @ y.T, 0.0, 2.0)
-
-    norms = np.sum(x * x, axis=1)
-    d2 = norms[:, None] + norms[None, :] - 2.0 * (x @ x.T)
-    d = np.sqrt(np.clip(d2, 0.0, None))
-    return d / np.sqrt(2.0) if mode == "sqrt" else d
-
-
-def _waveform_corr(a: np.ndarray, b: np.ndarray) -> float:
-    a = np.asarray(a, float) - np.mean(a)
-    b = np.asarray(b, float) - np.mean(b)
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na <= 1e-12 and nb <= 1e-12:
-        return 1.0
-    if na <= 1e-12 or nb <= 1e-12:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
-
-
-def _neighbor_score(
-    vectors: np.ndarray,
-    waveforms: list[np.ndarray],
-    mode: str,
-    seed: int,
+def _effective_rank_from_moments(
+    count: int,
+    sum_x: np.ndarray,
+    sum_x2: np.ndarray,
+    sum_outer: np.ndarray,
 ) -> tuple[float, float]:
-    distance = _pairwise_distance(vectors, mode)
-    np.fill_diagonal(distance, np.inf)
-    nearest = np.argmin(distance, axis=1)
-    rng = np.random.default_rng(seed)
-    near, random = [], []
-    for i, j in enumerate(nearest):
-        j = int(j)
-        near.append(_waveform_corr(waveforms[i], waveforms[j]))
-        candidates = [k for k in range(len(waveforms)) if k not in {i, j}]
-        if candidates:
-            random.append(_waveform_corr(waveforms[i], waveforms[int(rng.choice(candidates))]))
-    return float(np.mean(near)), float(np.mean(random)) if random else 0.0
-
-
-def _effective_rank(matrix: np.ndarray) -> tuple[float, float]:
-    x = np.asarray(matrix, dtype=np.float64)
-    active = np.std(x, axis=0) > 1e-12
-    if not np.any(active) or len(x) < 2:
+    if count < 2:
         return 0.0, 0.0
-    x = x[:, active]
-    x = (x - x.mean(0)) / x.std(0)
-    eig = np.clip(np.linalg.eigvalsh(x @ x.T), 0.0, None)
-    p = eig / max(eig.sum(), 1e-20)
-    p = p[p > 1e-15]
-    rank = float(np.exp(-np.sum(p * np.log(p))))
-    maximum = min(len(x) - 1, x.shape[1])
+    mean = sum_x / count
+    variance = np.clip(sum_x2 / count - mean * mean, 0.0, None)
+    std = np.sqrt(variance)
+    active = std > 1e-12
+    if not np.any(active):
+        return 0.0, 0.0
+    covariance = sum_outer / count - np.outer(mean, mean)
+    denom = np.outer(std, std)
+    correlation = np.divide(covariance, denom, out=np.zeros_like(covariance), where=denom > 1e-24)
+    correlation = correlation[np.ix_(active, active)]
+    eigenvalues = np.clip(np.linalg.eigvalsh(correlation), 0.0, None)
+    probabilities = eigenvalues / max(float(eigenvalues.sum()), 1e-20)
+    probabilities = probabilities[probabilities > 1e-15]
+    rank = float(np.exp(-np.sum(probabilities * np.log(probabilities))))
+    maximum = min(count - 1, int(np.count_nonzero(active)))
     return rank, rank / maximum if maximum else 0.0
 
 
-def evaluate_tlpp(
-    items,
-    output: Path,
-    trace_cfg: TraceConfig,
-    base_cfg: TLPPConfig,
-    variants: tuple[str, ...] = ("adaptive", "fixed", "multilag"),
-    probability_modes: tuple[str, ...] = ("raw", "sqrt", "log", "log01"),
-    window_starts: tuple[float, ...] = (0.0, 0.5, 1.0),
-    noise_snr_db: float = 20.0,
-    seed: int = 1729,
-) -> list[dict]:
-    traces, failures = [], []
-    for item in items:
-        try:
-            traces.append(load_trace(item, trace_cfg))
-        except Exception as exc:
-            failures.append((item.uuid, str(exc)))
-
-    rows = []
-    for variant in variants:
-        for probability_mode in probability_modes:
-            cfg = TLPPConfig(**{**base_cfg.to_dict(), "probability_mode": probability_mode})
-            rng = np.random.default_rng(seed)
-            vectors, waveforms, runtimes = [], [], []
-            window_error, scramble_error, noise_error = [], [], []
-
-            for trace in traces:
-                start = time.perf_counter()
-                reference = _vector(trace, cfg, variant)
-                runtimes.append((time.perf_counter() - start) * 1000.0)
-                vectors.append(reference)
-                waveforms.append(trace.current_a)
-
-                alternate = alternate_windows(trace, trace_cfg, window_starts)
-                if alternate:
-                    window_error.append(np.mean([
-                        _symmetric_l2(reference, _vector(other, cfg, variant))
-                        for other in alternate
-                    ]))
-
-                scrambled = phase_scramble(trace, trace_cfg, rng)
-                noisy = add_noise(trace, trace_cfg, noise_snr_db, rng)
-                scramble_error.append(_symmetric_l2(reference, _vector(scrambled, cfg, variant)))
-                noise_error.append(_symmetric_l2(reference, _vector(noisy, cfg, variant)))
-
-            matrix = np.asarray(vectors)
-            near, random = _neighbor_score(matrix, waveforms, probability_mode, seed)
-            rank, rank_fraction = _effective_rank(matrix)
-            rows.append({
-                "variant": variant,
-                "probability_mode": probability_mode,
-                "embedding_dim": int(matrix.shape[1]),
-                "processed": len(traces),
-                "failed": len(failures),
-                "window_consistency_error": float(np.mean(window_error)) if window_error else 0.0,
-                "scramble_error": float(np.mean(scramble_error)),
-                "noise_error": float(np.mean(noise_error)),
-                "nearest_waveform_corr": near,
-                "random_waveform_corr": random,
-                "effective_rank": rank,
-                "effective_rank_fraction": rank_fraction,
-                "milliseconds_per_trace": float(np.mean(runtimes)),
-            })
-
-    _write_results(
-        output,
-        rows,
-        failures,
-        {"trace": trace_cfg.to_dict(), "tlpp": base_cfg.to_dict()},
-    )
-    return rows
-
-
-def evaluate_vae(
-    items,
-    checkpoint: Path,
-    output: Path,
-    trace_cfg: TraceConfig,
-    embedding_dims: tuple[int, ...] = (),
-    window_starts: tuple[float, ...] = (0.0, 0.5, 1.0),
-    noise_snr_db: float = 20.0,
-    seed: int = 1729,
+def evaluate_vae_hdf5(
+    checkpoint: Path | str,
+    h5_paths: PathInputs,
+    output: Path | str,
+    embedding_dims: tuple[int, ...] = (4, 8, 16, 32, 64, 128),
+    batch_size: int = 64,
     device: str = "auto",
-) -> list[dict]:
-    model = TLPPVAE(checkpoint, device)
-    traces = [load_trace(item, trace_cfg) for item in items]
-    dims = embedding_dims or (model.cfg.latent_dim,)
-    rows = []
+    make_plots: bool = True,
+) -> dict:
+    """Evaluate one checkpoint over one or several universal TLPP HDF5 files.
 
-    for width in dims:
-        rng = np.random.default_rng(seed)
-        vectors, waveforms, runtimes = [], [], []
-        window_error, scramble_error, noise_error = [], [], []
-
-        for trace in traces:
-            start = time.perf_counter()
-            reference = model.embed_signal(trace.current_a, trace.sampling_hz, width)
-            runtimes.append((time.perf_counter() - start) * 1000.0)
-            vectors.append(reference)
-            waveforms.append(trace.current_a)
-
-            alternate = alternate_windows(trace, trace_cfg, window_starts)
-            if alternate:
-                window_error.append(np.mean([
-                    _symmetric_l2(
-                        reference,
-                        model.embed_signal(other.current_a, other.sampling_hz, width),
-                    )
-                    for other in alternate
-                ]))
-
-            scrambled = phase_scramble(trace, trace_cfg, rng)
-            noisy = add_noise(trace, trace_cfg, noise_snr_db, rng)
-            scramble_error.append(_symmetric_l2(
-                reference,
-                model.embed_signal(scrambled.current_a, scrambled.sampling_hz, width),
-            ))
-            noise_error.append(_symmetric_l2(
-                reference,
-                model.embed_signal(noisy.current_a, noisy.sampling_hz, width),
-            ))
-
-        matrix = np.asarray(vectors)
-        std = matrix.std(0)
-        standardized = (matrix - matrix.mean(0)) / np.where(std > 1e-12, std, 1.0)
-        near, random = _neighbor_score(standardized, waveforms, "raw", seed)
-        rank, rank_fraction = _effective_rank(matrix)
-        rows.append({
-            "variant": f"vae_{model.cfg.representation}",
-            "probability_mode": model.cfg.probability_mode,
-            "loss": model.cfg.reconstruction_loss,
-            "embedding_dim": int(width),
-            "processed": len(traces),
-            "failed": 0,
-            "window_consistency_error": float(np.mean(window_error)) if window_error else 0.0,
-            "scramble_error": float(np.mean(scramble_error)),
-            "noise_error": float(np.mean(noise_error)),
-            "nearest_waveform_corr": near,
-            "random_waveform_corr": random,
-            "effective_rank": rank,
-            "effective_rank_fraction": rank_fraction,
-            "milliseconds_per_trace": float(np.mean(runtimes)),
-        })
-
-    _write_results(
-        output,
-        rows,
-        [],
-        {"checkpoint": str(checkpoint), "trace": trace_cfg.to_dict()},
-    )
-    return rows
-
-
-def _write_results(output: Path, rows: list[dict], failures: list, config: dict) -> None:
+    Multiple files are treated as one logical split, matching the combined
+    subscale+fullscale training/validation setup.
+    """
+    checkpoint = Path(checkpoint)
+    paths = normalize_h5_paths(h5_paths)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    with (output / "summary.csv").open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        w.writerows(rows)
-    (output / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-    if failures:
-        with (output / "failures.csv").open("w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["uuid", "error"])
-            w.writerows(failures)
 
-    for row in rows:
-        print("=" * 72)
-        print(f"{row['variant']} / {row['probability_mode']}")
-        print("=" * 72)
-        for key, value in row.items():
-            print(f"{key}: {value}")
+    metadata = tuple(validate_universal_tlpp(path) for path in paths)
+    component_counts = [item.count for item in metadata]
+    total_count = sum(component_counts)
+
+    state, cfg, model, dev = load_vae_checkpoint(checkpoint, device)
+    sample_shape = tuple(state["sample_shape"])
+    if sample_shape != (1, 128, 128):
+        raise ValueError(f"Expected checkpoint input shape (1,128,128), got {sample_shape}")
+
+    dims = tuple(sorted({int(width) for width in embedding_dims if 0 < int(width) <= cfg.latent_dim}))
+    if cfg.latent_dim not in dims:
+        dims = (*dims, cfg.latent_dim)
+    if not dims:
+        raise ValueError("No valid embedding dimensions requested")
+
+    prefix_errors = {width: np.empty(total_count, dtype=np.float32) for width in dims}
+    latent_sum = np.zeros(cfg.latent_dim, dtype=np.float64)
+    latent_sq_sum = np.zeros(cfg.latent_dim, dtype=np.float64)
+    latent_outer_sum = np.zeros((cfg.latent_dim, cfg.latent_dim), dtype=np.float64)
+    kl_sum = np.zeros(cfg.latent_dim, dtype=np.float64)
+    log_epsilon = TLPPConfig().log_epsilon
+
+    trace_rows: list[tuple[int, int, str, int, str]] = []
+    aggregate_offset = 0
+
+    with torch.no_grad():
+        for component_index, path in enumerate(paths):
+            with h5py.File(path, "r") as h5:
+                counts_ds = h5["tlpp_counts"]
+                n = len(counts_ds)
+                for start in range(0, n, batch_size):
+                    stop = min(start + batch_size, n)
+                    counts = np.asarray(counts_ds[start:stop], dtype=np.float32)[:, None]
+                    probability = counts_to_probability(counts)
+                    model_input = transform_occupancy(probability, cfg.probability_mode, log_epsilon)
+                    x = torch.from_numpy(model_input).to(dev)
+                    probability_t = torch.from_numpy(probability).to(dev)
+
+                    mu, raw_logvar = model.stats(x)
+                    logvar = torch.clamp(raw_logvar, cfg.logvar_min, cfg.logvar_max)
+                    mu_np = mu.detach().cpu().numpy().astype(np.float64, copy=False)
+                    latent_sum += mu_np.sum(axis=0)
+                    latent_sq_sum += np.square(mu_np).sum(axis=0)
+                    latent_outer_sum += mu_np.T @ mu_np
+                    kl_dim = -0.5 * (1.0 + logvar - mu.pow(2) - torch.exp(logvar))
+                    kl_sum += kl_dim.sum(dim=0).detach().cpu().numpy()
+
+                    p = probability_t.flatten(2)
+                    p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                    sqrt_p = torch.sqrt(p.clamp_min(0.0))
+
+                    aggregate_slice = slice(aggregate_offset + start, aggregate_offset + stop)
+                    for width in dims:
+                        z = torch.zeros_like(mu)
+                        z[:, :width] = mu[:, :width]
+                        logits = model.decode(z)
+                        sqrt_q = torch.exp(0.5 * torch.log_softmax(logits.flatten(2), dim=-1))
+                        h2 = (1.0 - (sqrt_p * sqrt_q).sum(dim=-1)).clamp_min(0.0).mean(dim=1)
+                        prefix_errors[width][aggregate_slice] = h2.detach().cpu().numpy()
+
+                global_index = (
+                    np.asarray(h5["global_index"], dtype=np.uint64)
+                    if "global_index" in h5
+                    else np.arange(n, dtype=np.uint64)
+                )
+                trace_keys = list(h5["trace_key"].asstr()[:]) if "trace_key" in h5 else [str(i) for i in range(n)]
+                trace_rows.extend(
+                    (component_index, local_row, path.name, int(global_index[local_row]), trace_keys[local_row])
+                    for local_row in range(n)
+                )
+            aggregate_offset += n
+
+    latent_mean = latent_sum / total_count
+    latent_variance = np.clip(latent_sq_sum / total_count - latent_mean * latent_mean, 0.0, None)
+    latent_std = np.sqrt(latent_variance)
+    mean_kl_dim = kl_sum / total_count
+    effective_rank, rank_fraction = _effective_rank_from_moments(
+        total_count, latent_sum, latent_sq_sum, latent_outer_sum
+    )
+
+    prefix_metrics: dict[str, dict[str, float]] = {}
+    for width in dims:
+        values = prefix_errors[width]
+        prefix_metrics[str(width)] = {
+            "mean_hellinger_squared": float(np.mean(values)),
+            "median_hellinger_squared": float(np.median(values)),
+            "p90_hellinger_squared": float(np.percentile(values, 90)),
+            "p95_hellinger_squared": float(np.percentile(values, 95)),
+            "p99_hellinger_squared": float(np.percentile(values, 99)),
+            "mean_hellinger": float(np.mean(np.sqrt(values))),
+        }
+
+    metrics = {
+        "checkpoint": str(checkpoint),
+        "checkpoint_epoch": int(state.get("epoch", -1)),
+        "best_validation_loss": float(state.get("best_validation_loss", float("nan"))),
+        "datasets": [str(path) for path in paths],
+        "component_counts": component_counts,
+        "count": total_count,
+        "input_shape": list(sample_shape),
+        "latent_dim": int(cfg.latent_dim),
+        "embedding_dims": list(dims),
+        "probability_mode": cfg.probability_mode,
+        "reconstruction_loss": cfg.reconstruction_loss,
+        "prefix_metrics": prefix_metrics,
+        "latent_statistics": {
+            "effective_rank": effective_rank,
+            "effective_rank_fraction": rank_fraction,
+            "mean_abs_latent_mean": float(np.mean(np.abs(latent_mean))),
+            "mean_latent_std": float(np.mean(latent_std)),
+            "min_latent_std": float(np.min(latent_std)),
+            "max_latent_std": float(np.max(latent_std)),
+            "mean_kl_per_dimension": float(np.mean(mean_kl_dim)),
+            "active_dims_kl_gt_0.001": int(np.count_nonzero(mean_kl_dim > 0.001)),
+            "active_dims_kl_gt_0.01": int(np.count_nonzero(mean_kl_dim > 0.01)),
+            "active_dims_kl_gt_0.1": int(np.count_nonzero(mean_kl_dim > 0.1)),
+        },
+    }
+    (output / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+
+    with (output / "prefix_metrics.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "embedding_dim", "mean_hellinger_squared", "median_hellinger_squared",
+            "p90_hellinger_squared", "p95_hellinger_squared", "p99_hellinger_squared",
+            "mean_hellinger",
+        ])
+        for width in dims:
+            row = prefix_metrics[str(width)]
+            writer.writerow([
+                width,
+                row["mean_hellinger_squared"],
+                row["median_hellinger_squared"],
+                row["p90_hellinger_squared"],
+                row["p95_hellinger_squared"],
+                row["p99_hellinger_squared"],
+                row["mean_hellinger"],
+            ])
+
+    with (output / "latent_dimensions.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["dimension", "mu_mean", "mu_std", "mean_kl"])
+        for index in range(cfg.latent_dim):
+            writer.writerow([index + 1, latent_mean[index], latent_std[index], mean_kl_dim[index]])
+
+    with (output / "per_trace_errors.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "row", "component", "local_row", "dataset", "global_index", "trace_key",
+            *[f"h2_{width}d" for width in dims],
+        ])
+        for aggregate_row, (component, local_row, dataset, global_index, trace_key) in enumerate(trace_rows):
+            writer.writerow([
+                aggregate_row, component, local_row, dataset, global_index, trace_key,
+                *[float(prefix_errors[width][aggregate_row]) for width in dims],
+            ])
+
+    if make_plots:
+        from .plotting import plot_evaluation_summary
+        plot_evaluation_summary(output, checkpoint.parent / "history.csv")
+
+    print(f"HDF5 VAE evaluation complete: {output}")
+    print(f"datasets: {len(paths)}; traces: {total_count:,}")
+    print(f"effective rank: {effective_rank:.3f} ({rank_fraction:.3f})")
+    for width in dims:
+        print(f"  {width:3d}D: H^2 mean={prefix_metrics[str(width)]['mean_hellinger_squared']:.8f}")
+    return metrics
